@@ -5,8 +5,9 @@ import os
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.metrics import accuracy_score, f1_score
 
-from lcr.data import load_eurosat, split
+from lcr.data import load_eurosat, split, stratified_subset
 from lcr.degrade import NOISES, cloud, scratches, estimate_mask
 from lcr.classical import DENOISERS, INPAINTERS
 from lcr.metrics import all_metrics
@@ -14,19 +15,28 @@ from lcr.ssrf import SSRF
 from lcr.pconv import PConvUNet, restore
 from lcr import classifier as C
 
-DEV = "cuda" if torch.cuda.is_available() else "cpu"
+if torch.cuda.is_available():
+    DEV = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    DEV = "mps"
+else:
+    DEV = "cpu"
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=500)
+    ap.add_argument("--n", type=int, default=100)
+    ap.add_argument("--n-validation", type=int, default=1000,
+                    help="held-out images reserved for classifier validation")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     os.makedirs("results", exist_ok=True)
 
     X, y, _ = load_eurosat()
     _, te = split(y)
-    te = te[:a.n]
+    val = stratified_subset(te, y, a.n_validation, seed=2)
+    candidates = np.setdiff1d(te, val, assume_unique=False)
+    te = stratified_subset(candidates, y, a.n, seed=a.seed)
     imgs = X[te].astype(np.float32) / 255
     ys = y[te]
     rng = np.random.default_rng(a.seed)
@@ -37,14 +47,34 @@ def main():
     pconv.load_state_dict(torch.load("checkpoints/pconv.pt", map_location=DEV))
     pconv.eval()
 
-    rows = [dict(scenario="clean", method="none", **C.score(clf, imgs, ys, DEV))]
+    rows = []
+    per_image_rows = []
+
+    clean_pred = C.predict(clf, imgs, DEV)
+    rows.append(dict(scenario="clean", method="none", n_images=len(imgs),
+                     acc=float(accuracy_score(ys, clean_pred)),
+                     f1=float(f1_score(ys, clean_pred, average="macro"))))
+    for image_id, true_label, pred_label in zip(te, ys, clean_pred):
+        per_image_rows.append({"image_id": int(image_id), "scenario": "clean",
+                               "method": "none", "y_true": int(true_label),
+                               "y_pred": int(pred_label),
+                               "correct": bool(true_label == pred_label)})
 
     def log(scenario, method, restored):
         ms = [all_metrics(r, x) for r, x in zip(imgs, restored)]
-        row = dict(scenario=scenario, method=method,
+        pred = C.predict(clf, restored, DEV)
+        row = dict(scenario=scenario, method=method, n_images=len(restored),
                    **{k: float(np.mean([m[k] for m in ms])) for k in ms[0]},
-                   **C.score(clf, restored, ys, DEV))
+                   **{f"{k}_std": float(np.std([m[k] for m in ms], ddof=1))
+                      for k in ms[0]},
+                   acc=float(accuracy_score(ys, pred)),
+                   f1=float(f1_score(ys, pred, average="macro")))
         rows.append(row)
+        for image_id, true_label, pred_label, metric in zip(te, ys, pred, ms):
+            per_image_rows.append({"image_id": int(image_id), "scenario": scenario,
+                                   "method": method, "y_true": int(true_label),
+                                   "y_pred": int(pred_label),
+                                   "correct": bool(true_label == pred_label), **metric})
         print(f"{scenario:11s} {method:14s} PSNR {row['psnr']:.2f}  SSIM {row['ssim']:.3f}  "
               f"RMSE {row['rmse']:.4f}  acc {row['acc']:.3f}  F1 {row['f1']:.3f}")
 
@@ -76,7 +106,11 @@ def main():
 
     df = pd.DataFrame(rows)
     df.to_csv("results/benchmark.csv", index=False)
+    per_image = pd.DataFrame(per_image_rows)
+    per_image.to_csv("results/benchmark_per_image.csv", index=False)
     print("\n", df.round(4).to_string(index=False))
+    print("\nSaved summary to results/benchmark.csv")
+    print("Saved per-image records to results/benchmark_per_image.csv")
 
 
 if __name__ == "__main__":

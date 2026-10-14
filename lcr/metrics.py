@@ -14,5 +14,10 @@ def rmse(ref, x):
     return float(np.sqrt(np.mean((ref - x) ** 2)))
 
 
+def mse(ref, x):
+    return float(np.mean((ref - x) ** 2))
+
+
 def all_metrics(ref, x):
-    return {"psnr": psnr(ref, x), "ssim": ssim(ref, x), "rmse": rmse(ref, x)}
+    return {"mse": mse(ref, x), "psnr": psnr(ref, x),
+            "ssim": ssim(ref, x), "rmse": rmse(ref, x)}

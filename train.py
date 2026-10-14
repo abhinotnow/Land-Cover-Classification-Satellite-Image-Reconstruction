@@ -6,13 +6,19 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from lcr.data import load_eurosat, split
+from lcr.data import load_eurosat, split, stratified_subset
 from lcr import classifier as C
 from lcr.degrade import random_mask
 from lcr.pconv import PConvUNet
 from lcr.ssrf import SSRF
 
-DEV = "cuda" if torch.cuda.is_available() else "cpu"
+if torch.cuda.is_available():
+    DEV = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    DEV = "mps"
+else:
+    DEV = "cpu"
+print(f"training device: {DEV}")
 os.makedirs("checkpoints", exist_ok=True)
 
 
@@ -37,8 +43,8 @@ def train_clf(X, y, tr, te, epochs):
             opt.step()
             tot += loss.item() * len(b)
         s = C.score(model, Xte, y[te], DEV)
-        print(f"clf ep{ep + 1}: loss {tot / len(perm):.4f}  test acc {s['acc']:.4f}  f1 {s['f1']:.4f}")
-    torch.save(model.state_dict(), "checkpoints/clf.pt")
+        torch.save(model.state_dict(), "checkpoints/clf.pt")
+        print(f"clf ep{ep + 1}: loss {tot / len(perm):.4f}  test acc {s['acc']:.4f}  f1 {s['f1']:.4f}", flush=True)
 
 
 def train_ssrf(X, tr, n_imgs=2000):
@@ -76,7 +82,8 @@ def pconv_loss(out, gt, valid):
 def train_pconv(X, tr, epochs):
     model = PConvUNet().to(DEV)
     opt = torch.optim.Adam(model.parameters(), 2e-4)
-    dl = DataLoader(HoleSet(X[tr]), batch_size=64, shuffle=True, num_workers=2, drop_last=True)
+    # num_workers=0 avoids PyTorch shared-memory worker failures in restricted macOS runs.
+    dl = DataLoader(HoleSet(X[tr]), batch_size=64, shuffle=True, num_workers=0, drop_last=True)
     for ep in range(epochs):
         model.train()
         tot, n = 0.0, 0
@@ -88,17 +95,24 @@ def train_pconv(X, tr, epochs):
             opt.step()
             tot += loss.item()
             n += 1
-        print(f"pconv ep{ep + 1}: loss {tot / n:.4f}")
         torch.save(model.state_dict(), "checkpoints/pconv.pt")
+        print(f"pconv ep{ep + 1}: loss {tot / n:.4f}", flush=True)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("what", choices=["clf", "ssrf", "pconv"])
-    ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--n-train", type=int, default=3000,
+                    help="stratified EuroSAT training subset size")
+    ap.add_argument("--n-test", type=int, default=1000,
+                    help="stratified classifier validation subset size")
     a = ap.parse_args()
     X, y, _ = load_eurosat()
     tr, te = split(y)
+    tr = stratified_subset(tr, y, a.n_train, seed=1)
+    te = stratified_subset(te, y, a.n_test, seed=2)
+    print(f"using {len(tr)} training and {len(te)} validation images")
     if a.what == "clf":
         train_clf(X, y, tr, te, a.epochs)
     elif a.what == "ssrf":
